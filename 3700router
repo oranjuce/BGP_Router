@@ -1,0 +1,439 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse
+import socket
+import json
+import select
+import copy
+from collections import defaultdict
+
+
+class Router:
+
+    relations = {}
+    sockets = {}
+    ports = {}
+
+    forwarding_table = defaultdict(list)
+    disaggregated_forwarding_table = defaultdict(list)
+
+    update_msgs = []
+
+    def __init__(self, asn, connections):
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+
+            self.sockets[neighbor] = socket.socket(
+                socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(("localhost", 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            self.send(
+                neighbor,
+                json.dumps(
+                    {
+                        "type": "handshake",
+                        "src": self.our_addr(neighbor),
+                        "dst": neighbor,
+                        "msg": {},
+                    }
+                ),
+            )
+
+    def data(self, srcif, msg):
+        '''
+        Purpose:
+            Sends a message to the appropriate destination.
+        Parameters:
+            srcif: The source interface of the message.
+            msg: The message to be sent.
+        '''
+        routes = self.get_routes(msg)
+        if not routes:
+            self.no_route(srcif)
+            return
+        for neighbor, _ in self.reduce_routes(routes).items():
+            if self.relations[neighbor] == "cust" or self.relations[srcif] == "cust":
+                self.send(neighbor, json.dumps(msg))
+            else:
+                self.no_route(srcif)
+
+    def no_route(self, srcif):
+        '''
+        Purpose:
+            Sends a message to a specified node informing it that no route was found for a given message.
+        Parameters:
+            srcif: The source interface for which no route was found.
+        '''
+        self.send(
+            srcif,
+            json.dumps(
+                {"src": srcif[:-1] + "1", "dst": srcif, "type": "no route", "msg": {}})
+        )
+
+    def get_routes(self, msg):
+        '''
+        Purpose:
+            Finds the appropriate routes for a given message based on the forwarding table of the node.
+        Parameters:
+            msg: The message for which routes are to be found.
+        Returns:
+            The routes for a given message.
+        '''
+        routes = {}
+        dst = self.bin(msg["dst"])
+        longest = 0
+        for neighbor, network_list in self.forwarding_table.items():
+            for network in network_list:
+                network_bin = self.bin(network["network"])
+                mask = self.bin(network["netmask"])
+                match = mask & dst == mask & network_bin
+                if match:
+                    curr = bin(mask & dst & network_bin).count("1")
+                    if curr < longest:
+                        continue
+                    if curr > longest:
+                        longest = curr
+                        routes.clear()
+                    routes[neighbor] = network
+        return routes
+
+    def reduce_routes(self, routes):
+        '''
+        Purpose:
+            Reduces routes to only the best route for each neighbor.
+        Parameters:
+            routes: The routes to be filtered through
+        Returns: 
+            A dictionary that contains the best route for each neighboring node. 
+            If there is only one route, the original dictionary of routes is returned.
+        '''
+        if len(routes) > 1:
+
+            # Filters the routes by localpref
+            local_pref = max(routes.values(), key=lambda val: val["localpref"])[
+                "localpref"]
+            routes = dict(filter(lambda e: e[1]["localpref"] == local_pref, routes.items()))if len(
+                routes) > 1 else routes
+
+            # Filters the routes by selfOrigin
+            self_origin = dict(
+                filter(lambda e: e[1]["selfOrigin"] == True, routes.items()))
+            routes = self_origin if len(self_origin) > 0 else routes
+
+            # Filters the routes by ASPath
+            AS_path = len(
+                min(routes.values(), key=lambda v: len(v["ASPath"]))["ASPath"])
+            routes = dict(filter(lambda e: len(
+                e[1]["ASPath"]) == AS_path, routes.items())) if len(routes) > 1 else routes
+
+            # Filters the routes by origin
+            origin = {"IGP": 2, "EGP": 1, "UNK": 0}
+            best_origin = max(routes.values(), key=lambda v: origin[v["origin"]])[
+                "origin"]
+            routes = dict(filter(lambda e: e[1]["origin"] == best_origin, routes.items())) if len(
+                routes) > 1 else routes
+
+            # Filters the routes by ip
+            min_ip = min(routes)
+
+            return dict(filter(lambda e: e[0] == min_ip, routes.items()))
+
+        else:
+            return routes
+
+    def send_update_msgs(self, ip, msg):
+        '''
+        Purpose: 
+            Send an updated message to a specified IP address
+        Parameters:
+            ip: The destination IP address
+            msg: The message that will be sent
+
+        '''
+        self.send(ip,
+                  json.dumps({
+                      "src": ip[:-1] + "1",
+                      "dst": ip,
+                      "type": "update",
+                      "msg": {
+                          "network": msg["network"],
+                          "netmask": msg["netmask"],
+                          "ASPath": [self.asn] + msg["ASPath"],
+                      }
+                  })
+                  )
+
+    def update(self, srcif, msg):
+        '''
+        Purpose:
+            Updates the forwarding table of a network node based on a received message, and updates the neighbors or customers as necessary.
+        Parameters:
+            srcif: The source interface.
+            msg: The message to be forwarded.
+        '''
+        self.forwarding_table[srcif].append(msg["msg"])
+        self.disaggregated_forwarding_table[srcif].append(
+            copy.copy(msg["msg"]))
+        self.aggregate()
+        if self.relations[srcif] == "cust":
+            # sends update to all neighbors
+            for neighbor in self.sockets:
+                if neighbor != srcif:
+                    self.send_update_msgs(neighbor, msg["msg"])
+        else:
+            # sends update to all customers
+            for neighbor in self.sockets:
+                if self.relations[neighbor] == "cust":
+                    self.send_update_msgs(neighbor, msg["msg"])
+
+    def bin(self, ip):
+        '''
+        Purpose:
+            Takes in an IP address as a string and converts it into its binary representation.
+        Parameters:
+            ip: a string representing an IP address.
+        Returns:
+            An integer representing the binary value of the IP address.
+        '''
+        return int("".join(["%08d" % int(bin(int(x))[2:]) for x in ip.split(".")]), 2)
+
+    def sameAddress(self, ip1, ip2, netmask):
+        '''
+        Purpose:
+            Determines whether two IP addresses belong to the same network, given a netmask.
+        Parameters:
+            ip1: a string representing the first IP address.
+            ip2: a string representing the second IP address.
+            netmask: a string representing the netmask to be used for comparison.
+        Returns:
+            A boolean value indicating whether the two IP addresses belong to the same network.
+        '''
+        mask = self.bin(netmask)
+        return self.bin(ip1) & mask == self.bin(ip2) & mask
+
+    def send_neighbors(self, neighbors, message_type, message, skip):
+        '''
+        Purpose:
+            Sends a message to a list of neighbors, with the option to skip certain neighbors.
+        Parameters:
+            neighbors: a list of neighbors to whom the message will be sent.
+            message_type: a string indicating the type of message being sent.
+            message: a dictionary containing the message to be sent.
+            skip: a list of neighbors to skip when sending the message.
+        '''
+        for neighbor in neighbors:
+            if neighbor not in skip:
+                message = {
+                    "type": message_type,
+                    "src": self.our_addr(neighbor),
+                    "dst": neighbor,
+                    "msg": message,
+                }
+                self.send(neighbor, json.dumps(message))
+
+    def dump(self, message):
+        '''
+        Purpose:
+            Dumps the forwarding table to a neighbor in response to a message.
+        Parameters:
+            message: a dictionary containing information about the message received.
+        '''
+        self.send(
+            message["src"],
+            json.dumps({
+                "src": message["dst"],
+                "dst": message["src"],
+                "type": "table",
+                "msg": [
+                    {**network, "peer": neighbor}
+                    for neighbor, network_list in self.forwarding_table.items()
+                    for network in network_list
+                ],
+            })
+        )
+
+    def withdraw(self, srcif, msg):
+        '''
+        Purpose:
+            Withdraws a network from the forwarding table and notifies neighbors/customers.
+        Parameters:
+            srcif: the interface from which the message was received.
+            msg: a dictionary containing the network to be withdrawn.
+        '''
+        for dead_network in msg['msg']:
+            self.disaggregated_forwarding_table[srcif] = [network for network in self.disaggregated_forwarding_table[srcif] if not self.sameAddress(
+                network["network"], dead_network["network"], dead_network["netmask"])]
+        self.forwarding_table = copy.deepcopy(
+            self.disaggregated_forwarding_table)
+        self.aggregate()
+        if self.relations[srcif] == "cust":
+            for neighbor in self.sockets:
+                if neighbor != srcif:
+                    self.send_withdraw(neighbor, msg)
+        else:
+            for neighbor in self.sockets:
+                if self.relations[neighbor] == "cust":
+                    self.send_withdraw(neighbor, msg)
+
+    def send_withdraw(self, ip, msg):
+        '''
+        Purpose:
+            This method sends a withdrawal message to a neighbor.
+        Parameters:
+            ip: the IP address of the neighbor (string).
+            msg: a dictionary containing the withdrawal message (dict).
+        '''
+        msg["src"] = ip[:-1] + "1"
+        msg["dst"] = ip
+        self.send(ip, json.dumps(msg))
+
+    def our_addr(self, dst):
+        '''
+        Purpose:
+            Returns the IP address of the current node with a host address of 1 for a given destination IP address.
+        Parameters:
+            dst: the IP address of the destination node.
+        Returns:
+            A string representing the IP address of the current node with a host address of 1.
+        '''
+        quads = list(int(qdn) for qdn in dst.split("."))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+    def send(self, network, message):
+        '''
+        Purpose:
+            Sends a message to a specified network using the network's socket.
+        Parameters:
+            network: the name of the network to send the message to.
+            message: the message to send.
+        '''
+        self.sockets[network].sendto(message.encode(
+            "utf-8"), ("localhost", self.ports[network]))
+
+    def ip(self, binary):
+        '''
+        Purpose:
+            Converts a binary representation of an IP address into a string representation of an IP address.
+        Parameters:
+            binary: An integer representing the binary value of an IP address.
+        Returns:
+            A string representing the IP address.
+        '''
+        octet1 = (binary >> 24) & 0xFF
+        octet2 = (binary >> 16) & 0xFF
+        octet3 = (binary >> 8) & 0xFF
+        octet4 = binary & 0xFF
+        return f"{octet1}.{octet2}.{octet3}.{octet4}"
+
+    def condense(self, netmask_bin):
+        '''
+        Purpose:
+            To shorten the subnet mask to the smallest possible size.
+        Parameters:
+            netmask_bin: a binary integer representing the subnet mask.
+        Returns:
+            An integer representing the shortened subnet mask.
+        '''
+        mask = (1 << (netmask_bin.bit_length() - 1)) - 1
+        return (netmask_bin & mask) << 1
+
+    def get_prefix(self, network, netmask):
+        '''
+        Purpose:
+            To get the network prefix given a network address and a subnet mask.
+        Parameters:
+            network: an integer representing the network address.
+            netmask: an integer representing the subnet mask.
+        Returns:
+            A string representing the network prefix.
+        '''
+        binary_netmask = self.binary_str(netmask)
+        prefix_len = 0
+        for bit in binary_netmask:
+            if bit == '0':
+                break
+            prefix_len += 1
+        return self.binary_str(network)[:prefix_len]
+
+    def binary_str(self, ip):
+        '''
+        Purpose:
+            Convert an IP address represented as a string into its binary string representation.
+        Parameters:
+             ip: An IP address.
+        Returns:
+            A string representing the binary string representation of the IP address.
+        '''
+        return ''.join([f'{int(byte):08b}' for byte in ip.split('.')])
+
+    def aggregate(self):
+        for peer, network_list in self.forwarding_table.items():
+            while True:
+                network1_to_remove, network2_to_remove, aggregated_network = self.find_aggregate_network(peer, network_list)
+                
+                if aggregated_network is not None:
+                    self.forwarding_table[peer].remove(network1_to_remove)
+                    self.forwarding_table[peer].remove(network2_to_remove)
+                    self.forwarding_table[peer].append(aggregated_network)
+                else:
+                    break
+
+    def find_aggregate_network(self, peer, network_list):
+        for i, network1 in enumerate(network_list):
+            for j, network2 in enumerate(network_list[i+1:]):
+                j += i + 1
+                
+                prefix1 = self.get_prefix(network1['network'], network1['netmask'])
+                prefix2 = self.get_prefix(network2['network'], network2['netmask'])
+                
+                if (len(prefix1) == len(prefix2) 
+                    and prefix1[:-1] == prefix2[:-1] 
+                    and network1['localpref'] == network2['localpref'] 
+                    and network1['selfOrigin'] == network2['selfOrigin'] 
+                    and network1['ASPath'] == network2['ASPath'] 
+                    and network1['origin'] == network2['origin']):
+                    
+                    network1_to_remove = network1
+                    network2_to_remove = network2
+                    
+                    aggregated_network = network1.copy()
+                    aggregated_network['network'] = min(network1['network'], network2['network'])
+                    aggregated_network['netmask'] = self.ip(self.condense(self.bin(network1['netmask'])))
+                    
+                    return network1_to_remove, network2_to_remove, aggregated_network
+                    
+        return None, None, None
+
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+                msg = json.loads(k.decode("utf-8"))
+                {
+                    "update": lambda s, d: self.update(s, d),
+                    "data": lambda s, d: self.data(s, d),
+                    "dump": lambda _, d: self.dump(d),
+                    "withdraw": lambda s, d: self.withdraw(s, d),
+                }[msg["type"]](srcif, msg)
+                print("Received message:", msg)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="route packets")
+    parser.add_argument("asn", type=int, help="AS number of this router")
+    parser.add_argument(
+        "connections", metavar="connections", type=str, nargs="+", help="connections"
+    )
+    args = parser.parse_args()
+    router = Router(args.asn, args.connections)
+    router.run()
